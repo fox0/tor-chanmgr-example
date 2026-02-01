@@ -1,0 +1,15 @@
+[package]
+name = "tor-chanmgr-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+tor-chanmgr = "0.38"
+tor-linkspec = "0.38"
+tor-memquota = "0.38"
+tor-netdir = "0.38"
+tor-proto = "0.38"
+tor-rtcompat = { version = "0.38", features = ["native-tls", "tokio"] }
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["full"] }
