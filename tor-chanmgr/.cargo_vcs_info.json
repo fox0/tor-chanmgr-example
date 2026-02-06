@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "ea9fac019eb886e752652f0f49e9a320c9c98c51"
+  },
+  "path_in_vcs": "crates/tor-chanmgr"
+}
