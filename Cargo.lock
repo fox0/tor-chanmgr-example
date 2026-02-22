@@ -3519,6 +3519,7 @@ dependencies = [
  "tor-netdir",
  "tor-proto",
  "tor-rtcompat",
+ "tor-socksproto",
  "tracing-subscriber",
 ]
 

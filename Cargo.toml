@@ -5,14 +5,22 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-tor-chanmgr = "0.39"
+tor-chanmgr = { version = "0.39", features = [
+    "pt-client",
+] }
 tor-linkspec = "0.39"
 tor-memquota = "0.39"
 tor-netdir = "0.39"
 tor-proto = "0.39"
-tor-rtcompat = { version = "0.39", features = ["native-tls", "tokio"] }
+tor-rtcompat = { version = "0.39", features = [
+    "native-tls",
+    "tokio",
+] }
+tor-socksproto = "0.39"
 tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "full",
+] }
 
 [patch.crates-io]
 tor-chanmgr = { path = "tor-chanmgr" }
