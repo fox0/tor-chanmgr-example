@@ -5,7 +5,9 @@ use anyhow::Result;
 use tor_chanmgr::builder::ChanBuilder;
 use tor_chanmgr::factory::{BootstrapReporter, ChannelFactory};
 use tor_chanmgr::transport::proxied::ExternalProxyPlugin;
-use tor_chanmgr::{ChanMgr, ChanMgrConfig, ChannelUsage, Dormancy};
+use tor_chanmgr::{
+    ChanMgr, ChanMgrConfig, ChannelConfig, ChannelConfigBuilder, ChannelUsage, Dormancy,
+};
 use tor_linkspec::OwnedChanTarget;
 use tor_memquota::Config as MemquotaConfig;
 use tor_memquota::mtracker::MemoryQuotaTracker;
@@ -22,14 +24,24 @@ async fn main() -> Result<()> {
 
     let runtime = PreferredRuntime::current().unwrap();
 
-    // let config = ChanMgrConfig::default();
+    // let ccb = ChannelConfigBuilder::new();
+
+    let config = ChannelConfig::default();
+    config.outbound_proxy = None;  // TODO
+
     // let dormancy = Dormancy::default();
     // let netparams = NetParameters::default();
 
     // let memquota_config = MemquotaConfig::builder().build().unwrap();
     // let memquota = MemoryQuotaTracker::new(&runtime, memquota_config).unwrap();
 
-    // let chan_manager = ChanMgr::new(runtime.clone(), config, dormancy, &netparams, memquota);
+    // let chan_manager = ChanMgr::new(
+    //     runtime.clone(),
+    //     ChanMgrConfig::default(),
+    //     dormancy,
+    //     &netparams,
+    //     memquota,
+    // );
 
     // let target = OwnedChanTarget::from_chan_target(target);
     // let usage = ChannelUsage::Dir;
@@ -44,19 +56,10 @@ async fn main() -> Result<()> {
     let proxy_version = SocksVersion::V4; // TODO
     let transport = ExternalProxyPlugin::new(runtime.clone(), proxy_addr, proxy_version);
 
-    let builder = ChanBuilder::new(runtime, transport);
+    // let builder = ChanBuilder::new(runtime, transport);
+    // builder.connect_via_transport(target, reporter, memquota);
 
     //////////////////////////////////////////////////////////////////////////////////////
-
-    // See [`tor_chanmgr::ChanMgr::new`]
-
-    let (sender, receiver) = event::channel();
-    let sender = Arc::new(Mutex::new(sender));
-    let reporter = BootstrapReporter(sender);
-    let transport = transport::DefaultTransport::new(runtime.clone());
-    let builder = builder::ChanBuilder::new(runtime.clone(), transport);
-
-    // let reporter = BootstrapReporter::new();
 
     // let memquota_config = MemquotaConfig::builder().build().unwrap();
     // let memquota: ChannelAccount = MemoryQuotaTracker::new(&runtime, memquota_config)

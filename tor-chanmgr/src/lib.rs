@@ -42,6 +42,7 @@
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
+#![allow(clippy::collapsible_if)] // See arti#2342
 #![deny(clippy::unused_async)]
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
@@ -99,8 +100,7 @@ use tor_rtcompat::scheduler::{TaskHandle, TaskSchedule};
 ///
 /// Use the [`ChanMgr::get_or_launch`] function to create a new [`Channel`], or
 /// get one if it exists.  (For a slightly lower-level API that does no caching,
-/// see [`ChannelFactory`](factory::ChannelFactory) and its implementors.  For a
-/// much lower-level API, see [`tor_proto::channel::ChannelBuilder`].)
+/// see [`ChannelFactory`](factory::ChannelFactory) and its implementors.
 ///
 /// Each channel is kept open as long as there is a reference to it, or
 /// something else (such as the relay or a network error) kills the channel.
@@ -139,6 +139,7 @@ pub struct ChanMgr<R: Runtime> {
     bootstrap_status: event::ConnStatusEvents,
 
     /// The runtime. Needed to possibly spawn tasks.
+    #[allow(unused)] // Relay use this, not client yet. Keep it here instead of gating.
     runtime: R,
 }
 
@@ -229,23 +230,26 @@ impl<R: Runtime> ChanMgr<R> {
         dormancy: Dormancy,
         netparams: &NetParameters,
         memquota: ToplevelAccount,
-    ) -> Self
+    ) -> Result<Self>
     where
         R: 'static,
     {
         let (sender, receiver) = event::channel();
         let sender = Arc::new(std::sync::Mutex::new(sender));
         let reporter = BootstrapReporter(sender);
-        let transport = transport::DefaultTransport::new(runtime.clone());
-        let builder = builder::ChanBuilder::new(runtime.clone(), transport);
-
-        // Set relay identity keys if we have any. Remember, bridges are relays but will be acting
-        // as a client when establishing channels.
-        #[cfg(feature = "relay")]
-        let builder = if let Some(ids) = &config.identities {
-            builder.with_identities(ids.clone())
-        } else {
-            builder
+        let transport =
+            transport::DefaultTransport::new(runtime.clone(), config.cfg.outbound_proxy.clone());
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "relay")] {
+                let builder = if let Some(identities) = &config.identities {
+                    builder::ChanBuilder::new_relay(runtime.clone(), transport, identities.clone())?
+                } else {
+                    // Yes, clients can have the "relay" feature enabled (unit tests).
+                    builder::ChanBuilder::new_client(runtime.clone(), transport)
+                };
+            } else {
+                let builder =  builder::ChanBuilder::new_client(runtime.clone(), transport);
+            }
         };
 
         let factory = factory::CompoundFactory::new(
@@ -255,11 +259,11 @@ impl<R: Runtime> ChanMgr<R> {
         );
         let mgr =
             mgr::AbstractChanMgr::new(factory, config.cfg, dormancy, netparams, reporter, memquota);
-        ChanMgr {
+        Ok(ChanMgr {
             mgr,
             bootstrap_status: receiver,
             runtime,
-        }
+        })
     }
 
     /// Launch the periodic daemon tasks required by the manager to function properly.
@@ -309,6 +313,12 @@ impl<R: Runtime> ChanMgr<R> {
 
     /// Try to get a suitable channel to the provided `target`,
     /// launching one if one does not exist.
+    ///
+    /// This function does not guarantee that the returned channel
+    /// satisfies all of the properties of `target`. For example if an
+    /// existing channel is returned, it might not be connected to any
+    /// of the addresses specified in `target`.
+    // ^ see https://gitlab.torproject.org/tpo/core/arti/-/issues/2344
     ///
     /// If there is already a channel launch attempt in progress, this
     /// function will wait until that launch is complete, and succeed
@@ -484,7 +494,7 @@ impl<R: Runtime> ChanMgr<R> {
 impl<R: Runtime> ChannelProvider for ChanMgr<R> {
     type BuildSpec = OwnedChanTarget;
 
-    async fn get_or_launch(
+    fn get_or_launch(
         self: Arc<Self>,
         reactor_id: tor_proto::circuit::UniqId,
         target: Self::BuildSpec,

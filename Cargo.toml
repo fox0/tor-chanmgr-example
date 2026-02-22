@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 tor-chanmgr = { version = "0.39", features = [
-    "pt-client",
+#    "pt-client",
 ] }
 tor-linkspec = "0.39"
 tor-memquota = "0.39"
@@ -24,3 +24,9 @@ tokio = { version = "1", features = [
 
 [patch.crates-io]
 tor-chanmgr = { path = "tor-chanmgr" }
+
+[lints.rust]
+#unused_imports = "allow"
+#unused = "allow"
+
+[lints.clippy]

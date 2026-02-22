@@ -21,7 +21,13 @@ use tor_rtcompat::{Runtime, TlsProvider, tls::TlsConnector};
 use tracing::instrument;
 
 #[cfg(feature = "relay")]
-use {safelog::Sensitive, std::net::IpAddr, tor_proto::RelayIdentities};
+use {
+    futures::{AsyncRead, AsyncWrite},
+    safelog::Sensitive,
+    std::net::IpAddr,
+    tor_proto::{RelayIdentities, peer::PeerAddr},
+    tor_rtcompat::{CertifiedConn, StreamOps},
+};
 
 /// TLS-based channel builder.
 ///
@@ -45,6 +51,9 @@ where
     transport: H,
     /// Object to build TLS connections.
     tls_connector: <R as TlsProvider<H::Stream>>::Connector,
+    /// Object to accept TLS connections.
+    #[cfg(feature = "relay")]
+    tls_acceptor: Option<<R as TlsProvider<H::Stream>>::Acceptor>,
     /// Relay identities needed for relay channels.
     #[cfg(feature = "relay")]
     identities: Option<Arc<RelayIdentities>>,
@@ -54,23 +63,42 @@ impl<R: Runtime, H: TransportImplHelper> ChanBuilder<R, H>
 where
     R: TlsProvider<H::Stream>,
 {
-    /// Construct a new ChanBuilder.
-    pub fn new(runtime: R, transport: H) -> Self {
+    /// Construct a new client specific ChanBuilder.
+    pub fn new_client(runtime: R, transport: H) -> Self {
         let tls_connector = <R as TlsProvider<H::Stream>>::tls_connector(&runtime);
         ChanBuilder {
             runtime,
             transport,
             tls_connector,
             #[cfg(feature = "relay")]
+            tls_acceptor: None,
+            #[cfg(feature = "relay")]
             identities: None,
         }
     }
 
-    /// Set the relay identities and return itself.
+    /// Construct a new relay specific ChanBuilder.
     #[cfg(feature = "relay")]
-    pub fn with_identities(mut self, ids: Arc<RelayIdentities>) -> Self {
-        self.identities = Some(ids);
-        self
+    pub fn new_relay(
+        runtime: R,
+        transport: H,
+        identities: Arc<RelayIdentities>,
+    ) -> crate::Result<Self> {
+        use tor_error::into_internal;
+        use tor_rtcompat::tls::TlsAcceptorSettings;
+
+        // Build the TLS acceptor.
+        let tls_settings = TlsAcceptorSettings::new(identities.tls_key_and_cert())
+            .map_err(into_internal!("Unable to build TLS acceptor setting"))?;
+        let tls_acceptor = <R as TlsProvider<H::Stream>>::tls_acceptor(&runtime, tls_settings)
+            .map_err(into_internal!("Unable to build TLS acceptor"))?;
+
+        // Same builder as a client but with identities and acceptor.
+        let mut builder = Self::new_client(runtime, transport);
+        builder.identities = Some(identities);
+        builder.tls_acceptor = Some(tls_acceptor);
+
+        Ok(builder)
     }
 
     /// Return the outbound channel type of this config.
@@ -85,7 +113,6 @@ where
         if self.identities.is_some() {
             return ChannelType::RelayInitiator;
         }
-        // No relay built in, always client.
         ChannelType::ClientInitiator
     }
 }
@@ -133,24 +160,96 @@ where
     async fn accept_from_transport(
         &self,
         peer: Sensitive<std::net::SocketAddr>,
-        _my_addrs: Vec<IpAddr>,
+        my_addrs: Vec<IpAddr>,
         stream: Self::Stream,
-        _memquota: ChannelAccount,
+        memquota: ChannelAccount,
     ) -> crate::Result<Arc<tor_proto::channel::Channel>> {
+        use tor_linkspec::OwnedChanTargetBuilder;
+        use tor_proto::relay::MaybeVerifiableRelayResponderChannel;
+
+        let target = OwnedChanTargetBuilder::default()
+            .addrs(vec![peer.into_inner()])
+            .build()
+            .map_err(|e| internal!("Unable to build chan target from peer sockaddr: {e}"))?;
+
+        // Helpers: For error mapping.
         let map_ioe = |ioe, action| Error::Io {
             action,
             peer: Some(BridgeAddr::new_addr_from_sockaddr(peer.into_inner()).into()),
             source: ioe,
         };
+        let map_proto = |source, target: &OwnedChanTarget, clock_skew| Error::Proto {
+            source,
+            peer: target.to_logged(),
+            clock_skew,
+        };
 
-        let _tls = self
-            .tls_connector
+        let tls = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or(internal!("Accepting connection without TLS acceptor"))?
             .negotiate_unvalidated(stream, "ignored")
             .await
             .map_err(|e| map_ioe(e.into(), "TLS negotiation"))?;
+        let identities = self
+            .identities
+            .as_ref()
+            .ok_or(internal!(
+                "Unable to build relay channel without identities"
+            ))?
+            .clone();
 
-        // TODO RELAY: do handshake and build channel
-        todo!();
+        let peer_cert = tls
+            .peer_certificate()
+            .map_err(|e| map_ioe(e.into(), "TLS Certs"))?
+            .ok_or_else(|| Error::Internal(internal!("TLS connection with no peer certificate")))?
+            // Note: we could skip this "into_owned" if we computed any necessary digest on the
+            // certificate earlier.  That would require changing out channel negotiation APIs,
+            // though, and might not be worth it.
+            .into_owned();
+        let our_cert = tls
+            .own_certificate()
+            .map_err(|e| map_ioe(e.into(), "TLS Certs"))?
+            .ok_or_else(|| Error::Internal(internal!("TLS connection without our certificate")))?
+            .into_owned();
+        let builder = tor_proto::RelayChannelBuilder::new();
+
+        let unverified = builder
+            .accept(
+                peer,
+                my_addrs,
+                tls,
+                self.runtime.clone(),
+                identities,
+                memquota,
+            )
+            .handshake(|| self.runtime.wallclock())
+            .await
+            .map_err(|e| map_proto(e, &target, None))?;
+
+        let (chan, reactor) = match unverified {
+            MaybeVerifiableRelayResponderChannel::Verifiable(c) => {
+                let clock_skew = c.clock_skew();
+                let now = self.runtime.wallclock();
+                c.verify(&target, &peer_cert, &our_cert, Some(now))
+                    .map_err(|e| map_proto(e, &target, Some(clock_skew)))?
+                    .finish()
+                    .await
+                    .map_err(|e| map_proto(e, &target, Some(clock_skew)))?
+            }
+            MaybeVerifiableRelayResponderChannel::NonVerifiable(c) => {
+                c.finish().map_err(|e| map_proto(e, &target, None))?
+            }
+        };
+
+        // Launch a task to run the channel reactor.
+        self.runtime
+            .spawn(async {
+                let _ = reactor.run().await;
+            })
+            .map_err(|e| Error::from_spawn("responder channel reactor", e))?;
+
+        Ok(chan)
     }
 }
 
@@ -177,21 +276,27 @@ where
 
         // 1a. Negotiate the TCP connection or other stream.
 
-        let (using_target, stream) = self.transport.connect(target).await?;
-        let using_method = using_target.chan_method();
-        let peer = using_method.target_addr();
-        let peer_ref = &peer;
+        // The returned PeerAddr is the actual address we are connected to.
+        let (peer_addr, stream) = self.transport.connect(target).await?;
+
+        // TODO(relay): We put the `target` in the error but actually, we should use the
+        // `peer_addr` as it is the address used while the target is possibly a bunch of addresses.
+        // This will also require us to implement "Sensitive" for a PeerAddr to avoid leaking IPs.
 
         let map_ioe = |action: &'static str| {
-            let peer: Option<BridgeAddr> = peer_ref.as_ref().and_then(|peer| {
-                let peer: Option<BridgeAddr> = peer.clone().into();
-                peer
-            });
+            let peer: Option<BridgeAddr> = (&peer_addr).into();
             move |ioe: io::Error| Error::Io {
                 action,
                 peer: peer.map(Into::into),
                 source: ioe.into(),
             }
+        };
+
+        // Helper to map protocol level error.
+        let map_proto = |source, target: &OwnedChanTarget, clock_skew| Error::Proto {
+            source,
+            peer: target.to_logged(),
+            clock_skew,
         };
 
         {
@@ -217,7 +322,11 @@ where
         let peer_cert = tls
             .peer_certificate()
             .map_err(map_ioe("TLS certs"))?
-            .ok_or_else(|| Error::Internal(internal!("TLS connection with no peer certificate")))?;
+            .ok_or_else(|| Error::Internal(internal!("TLS connection with no peer certificate")))?
+            // Note: we could skip this "into_owned" if we computed any necessary digest on the
+            // certificate earlier.  That would require changing out channel negotiation APIs,
+            // though, and might not be worth it.
+            .into_owned();
 
         {
             event_sender
@@ -225,6 +334,7 @@ where
                 .expect("Lock poisoned")
                 .record_tls_finished();
         }
+        let now = self.runtime.wallclock();
 
         // Store this so we can log it in case we don't recognize it.
         let outbound_chan_type = self.outbound_chan_type();
@@ -234,7 +344,7 @@ where
                 let mut builder = tor_proto::ClientChannelBuilder::new();
                 builder.set_declared_method(target.chan_method());
 
-                builder
+                let unverified = builder
                     .launch(
                         tls,
                         self.runtime.clone(), /* TODO provide ZST SleepProvider instead */
@@ -242,32 +352,44 @@ where
                     )
                     .connect(|| self.runtime.wallclock())
                     .await
-                    .map_err(|e| Error::from_proto_no_skew(e, target))?
+                    .map_err(|e| Error::from_proto_no_skew(e, target))?;
+
+                let clock_skew = unverified.clock_skew();
+                let (chan, reactor) = unverified
+                    .verify(target, &peer_cert, Some(now))
+                    .map_err(|source| match &source {
+                        tor_proto::Error::HandshakeCertsExpired { .. } => {
+                            event_sender
+                                .lock()
+                                .expect("Lock poisoned")
+                                .record_handshake_done_with_skewed_clock();
+                            map_proto(source, target, Some(clock_skew))
+                        }
+                        _ => Error::from_proto_no_skew(source, target),
+                    })?
+                    .finish(peer_addr)
+                    .await
+                    .map_err(|e| map_proto(e, target, Some(clock_skew)))?;
+
+                // Launch a task to run the channel reactor.
+                self.runtime
+                    .spawn(async {
+                        let _ = reactor.run().await;
+                    })
+                    .map_err(|e| Error::from_spawn("client channel reactor", e))?;
+                chan
             }
             #[cfg(feature = "relay")]
             ChannelType::RelayInitiator => {
-                let builder = tor_proto::RelayChannelBuilder::new();
-                let identities = self
-                    .identities
-                    .as_ref()
-                    .ok_or(internal!(
-                        "Unable to build relay channel without identities"
-                    ))?
-                    .clone();
-
-                // TODO(relay): Get the my_addrs from ChanBuilder or as function param.
-                let my_addrs = Vec::new();
-                builder
-                    .launch(
-                        tls,
-                        self.runtime.clone(), /* TODO provide ZST SleepProvider instead */
-                        identities,
-                        my_addrs,
-                        memquota,
-                    )
-                    .connect(|| self.runtime.wallclock())
-                    .await
-                    .map_err(|e| Error::from_proto_no_skew(e, &using_target))?
+                self.build_relay_channel(
+                    tls,
+                    peer_addr,
+                    target,
+                    &peer_cert,
+                    memquota,
+                    event_sender.clone(),
+                )
+                .await?
             }
             _ => {
                 return Err(Error::Internal(internal!(
@@ -276,10 +398,58 @@ where
             }
         };
 
-        let clock_skew = Some(chan.clock_skew()); // Not yet authenticated; can't use it till `check` is done.
+        event_sender
+            .lock()
+            .expect("Lock poisoned")
+            .record_handshake_done();
+
+        Ok(chan)
+    }
+
+    /// Build a relay initiator channel.
+    ///
+    /// This spawns the Reactor and return the [`tor_proto::channel::Channel`].
+    #[cfg(feature = "relay")]
+    async fn build_relay_channel<T>(
+        &self,
+        tls: T,
+        peer_addr: PeerAddr,
+        target: &OwnedChanTarget,
+        peer_cert: &[u8],
+        memquota: ChannelAccount,
+        event_sender: Arc<Mutex<ChanMgrEventSender>>,
+    ) -> crate::Result<Arc<tor_proto::channel::Channel>>
+    where
+        T: AsyncRead + AsyncWrite + CertifiedConn + StreamOps + Send + Unpin + 'static,
+    {
+        let builder = tor_proto::RelayChannelBuilder::new();
+        let identities = self
+            .identities
+            .as_ref()
+            .ok_or(internal!(
+                "Unable to build relay channel without identities"
+            ))?
+            .clone();
+
+        // TODO(relay): Get the my_addrs from ChanBuilder or as function param.
+        let my_addrs = Vec::new();
+        let unverified = builder
+            .launch(
+                tls,
+                self.runtime.clone(), /* TODO provide ZST SleepProvider instead */
+                identities,
+                my_addrs,
+                target,
+                memquota,
+            )
+            .connect(|| self.runtime.wallclock())
+            .await
+            .map_err(|e| Error::from_proto_no_skew(e, target))?;
+
         let now = self.runtime.wallclock();
-        let chan = chan
-            .check(target, &peer_cert, Some(now))
+        let clock_skew = unverified.clock_skew();
+        let (chan, reactor) = unverified
+            .verify(target, peer_cert, Some(now))
             .map_err(|source| match &source {
                 tor_proto::Error::HandshakeCertsExpired { .. } => {
                     event_sender
@@ -288,37 +458,38 @@ where
                         .record_handshake_done_with_skewed_clock();
                     Error::Proto {
                         source,
-                        peer: using_target.to_logged(),
-                        clock_skew,
+                        peer: target.to_logged(),
+                        clock_skew: Some(clock_skew),
                     }
                 }
-                _ => Error::from_proto_no_skew(source, &using_target),
+                _ => Error::from_proto_no_skew(source, target),
+            })?
+            .finish(peer_addr)
+            .await
+            .map_err(|source| Error::Proto {
+                source,
+                peer: target.to_logged(),
+                clock_skew: Some(clock_skew),
             })?;
-        let (chan, reactor) = chan.finish().await.map_err(|source| Error::Proto {
-            source,
-            peer: target.to_logged(),
-            clock_skew,
-        })?;
 
-        {
-            event_sender
-                .lock()
-                .expect("Lock poisoned")
-                .record_handshake_done();
-        }
-
-        // 3. Launch a task to run the channel reactor.
+        // Launch a task to run the channel reactor.
         self.runtime
             .spawn(async {
                 let _ = reactor.run().await;
             })
-            .map_err(|e| Error::from_spawn("channel reactor", e))?;
+            .map_err(|e| Error::from_spawn("relay channel reactor", e))?;
 
         Ok(chan)
     }
 }
 
 impl crate::mgr::AbstractChannel for tor_proto::channel::Channel {
+    fn is_canonical(&self) -> bool {
+        self.is_canonical()
+    }
+    fn is_canonical_to_peer(&self) -> bool {
+        self.is_canonical_to_peer()
+    }
     fn is_usable(&self) -> bool {
         !self.is_closing()
     }
@@ -420,8 +591,8 @@ mod test {
             client_rt.jump_to(now);
 
             // Create the channel builder that we want to test.
-            let transport = crate::transport::DefaultTransport::new(client_rt.clone());
-            let builder = ChanBuilder::new(client_rt, transport);
+            let transport = crate::transport::DefaultTransport::new(client_rt.clone(), None);
+            let builder = ChanBuilder::new_client(client_rt, transport);
 
             let (r1, r2): (Result<Arc<Channel>>, Result<LocalStream>) = futures::join!(
                 async {
